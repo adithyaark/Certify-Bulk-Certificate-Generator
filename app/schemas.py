@@ -41,6 +41,9 @@ class JobItemResponse(BaseModel):
     status: str
     error_message: str | None = None
     download_url: str | None = None
+    email_status: str
+    email_error_message: str | None = None
+    email_sent_at: datetime | None = None
 
 
 class JobCreateResponse(BaseModel):
@@ -58,6 +61,10 @@ class JobStatusResponse(BaseModel):
     succeeded: int
     failed: int
     pending: int
+    email_sent: int
+    email_failed: int
+    email_pending: int
+    email_skipped: int
     created_at: datetime
     completed_at: datetime | None
     items: list[JobItemResponse]

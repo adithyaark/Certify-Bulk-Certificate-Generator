@@ -8,9 +8,11 @@ from typing import Any
 import streamlit as st
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.db import SessionLocal, create_db
-from app.models import Job, JobStatus
+from app.models import EmailStatus, Job, JobStatus
 from app.schemas import JobCreateRequest, RecipientInput
+from app.services.email import email_configuration_error
 from app.services.job_service import (
     create_job,
     get_certificate,
@@ -34,6 +36,9 @@ STATUS_LABELS = {
     JobStatus.COMPLETED: "Complete",
     JobStatus.COMPLETED_WITH_ERRORS: "Complete with errors",
     JobStatus.FAILED: "Failed",
+    EmailStatus.SENT: "Emailed",
+    EmailStatus.SENDING: "Sending",
+    EmailStatus.SKIPPED: "Not sent",
 }
 
 
@@ -485,7 +490,8 @@ def _render_sidebar() -> None:
         steps = [
             ("01", "Add your event details"),
             ("02", "Import or edit recipients"),
-            ("03", "Download every certificate"),
+            ("03", "Generate every certificate"),
+            ("04", "Email or download the results"),
         ]
         for index, text in steps:
             st.markdown(
@@ -536,11 +542,12 @@ def _render_active_job(job_id: str) -> None:
     with header_right:
         st.markdown(_status_pill(snapshot.status), unsafe_allow_html=True)
 
-    metric_columns = st.columns(4)
+    metric_columns = st.columns(5)
     metric_data = [
         ("Total", snapshot.total, "recipients"),
         ("Ready", snapshot.succeeded, "PDFs generated"),
-        ("Needs review", snapshot.failed, "items with errors"),
+        ("Emailed", snapshot.email_sent, "delivery accepted"),
+        ("Needs review", snapshot.failed + snapshot.email_failed, "items with errors"),
         ("Pending", snapshot.pending, "still in queue"),
     ]
     for column, (label, value, note) in zip(metric_columns, metric_data):
@@ -552,6 +559,12 @@ def _render_active_job(job_id: str) -> None:
 
     if snapshot.pending:
         st.info("This job still has pending items. Refresh the page to check for updates.")
+
+    if snapshot.email_failed:
+        st.warning(
+            f"{snapshot.email_failed} certificate{'s' if snapshot.email_failed != 1 else ''} "
+            "could not be emailed. The generated PDFs are still available to download."
+        )
 
     if snapshot.succeeded:
         with SessionLocal() as db:
@@ -581,7 +594,12 @@ def _render_active_job(job_id: str) -> None:
                 if item.error_message:
                     st.caption(item.error_message)
                 else:
-                    st.markdown(_status_pill(item.status), unsafe_allow_html=True)
+                    st.markdown(
+                        f"{_status_pill(item.status)} &nbsp; {_status_pill(item.email_status)}",
+                        unsafe_allow_html=True,
+                    )
+                if item.email_error_message:
+                    st.caption(f"Email: {item.email_error_message}")
             with row_right:
                 if item.status == "SUCCESS":
                     with SessionLocal() as db:
@@ -643,6 +661,18 @@ def main() -> None:
             max_chars=255,
         )
         issue_date = st.date_input("Issue date", value=st.session_state.get("issue_date", date.today()))
+
+        settings = get_settings()
+        configuration_error = email_configuration_error(settings)
+        if not settings.email_enabled:
+            st.info(
+                "Email delivery is currently off. Set EMAIL_ENABLED=true and the SMTP settings in your "
+                "environment to send each generated certificate automatically."
+            )
+        elif configuration_error:
+            st.error(configuration_error)
+        else:
+            st.success("Email delivery is enabled. Each successful PDF will be sent to its matching email address.")
 
         st.markdown('<div style="height:.55rem"></div>', unsafe_allow_html=True)
         st.markdown('<div class="surface-title"><span class="step-number">02</span>Recipient list</div>', unsafe_allow_html=True)
@@ -706,7 +736,10 @@ def main() -> None:
                     st.session_state.event_name = event_name
                     st.session_state.issue_date = issue_date
                     st.session_state.active_job_id = created.job_id
-                    st.success(f"Generation finished for {created.total} recipients.")
+                    if get_settings().email_enabled and not email_configuration_error(get_settings()):
+                        st.success(f"Generated and emailed certificates for {created.total} recipients.")
+                    else:
+                        st.success(f"Generation finished for {created.total} recipients.")
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Generation could not be started: {exc}")

@@ -13,12 +13,12 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import CertificateItem, CertificateItemStatus, Job, JobStatus
+from app.models import CertificateItem, CertificateItemStatus, EmailStatus, Job, JobStatus
 from app.schemas import JobCreateRequest, JobCreateResponse, JobStatusResponse
+from app.services.email_validation import validate_single_mailbox
 from app.services.storage import ensure_within_storage_dir
 
 logger = logging.getLogger(__name__)
-EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$")
 
 
 def _validate_recipient(recipient: dict[str, str]) -> tuple[str, str]:
@@ -27,9 +27,7 @@ def _validate_recipient(recipient: dict[str, str]) -> tuple[str, str]:
 
     if not 1 <= len(name) <= 100:
         raise ValueError("Recipient name is required and must be 1-100 characters")
-    if not EMAIL_PATTERN.fullmatch(email):
-        raise ValueError("Invalid email format")
-    return name, email
+    return name, validate_single_mailbox(email, field_name="Recipient email")
 
 
 def _get_item_status_counts(db: Session, job_id: str) -> dict[str, int]:
@@ -37,15 +35,38 @@ def _get_item_status_counts(db: Session, job_id: str) -> dict[str, int]:
         "succeeded": 0,
         "failed": 0,
         "pending": 0,
+        "email_sent": 0,
+        "email_failed": 0,
+        "email_pending": 0,
+        "email_skipped": 0,
     }
     result = db.execute(
         select(
             func.count(case((CertificateItem.status == CertificateItemStatus.SUCCESS, 1))),
             func.count(case((CertificateItem.status == CertificateItemStatus.FAILED, 1))),
             func.count(case((CertificateItem.status == CertificateItemStatus.PENDING, 1))),
+            func.count(case((CertificateItem.email_status == EmailStatus.SENT, 1))),
+            func.count(case((CertificateItem.email_status == EmailStatus.FAILED, 1))),
+            func.count(
+                case(
+                    (
+                        CertificateItem.email_status.in_({EmailStatus.PENDING, EmailStatus.SENDING}),
+                        1,
+                    )
+                )
+            ),
+            func.count(case((CertificateItem.email_status == EmailStatus.SKIPPED, 1))),
         ).where(CertificateItem.job_id == job_id)
     ).one()
-    counts["succeeded"], counts["failed"], counts["pending"] = result
+    (
+        counts["succeeded"],
+        counts["failed"],
+        counts["pending"],
+        counts["email_sent"],
+        counts["email_failed"],
+        counts["email_pending"],
+        counts["email_skipped"],
+    ) = result
     return counts
 
 
@@ -59,6 +80,9 @@ def _item_to_response(item: CertificateItem) -> dict[str, object]:
         "download_url": (
             f"/jobs/{item.job_id}/certificates/{item.id}" if item.status == CertificateItemStatus.SUCCESS else None
         ),
+        "email_status": item.email_status,
+        "email_error_message": item.email_error_message,
+        "email_sent_at": item.email_sent_at,
     }
 
 
@@ -168,12 +192,14 @@ def create_job(db: Session, request: JobCreateRequest) -> JobCreateResponse:
     for recipient in request.recipients:
         key = (recipient.name.strip().lower(), recipient.email.strip().lower())
         status_value = CertificateItemStatus.PENDING
+        email_status = EmailStatus.PENDING
         error_message = None
 
         try:
             name, email = _validate_recipient(recipient.model_dump())
             if key in seen:
                 status_value = CertificateItemStatus.FAILED
+                email_status = EmailStatus.SKIPPED
                 error_message = "Duplicate recipient in this request"
             else:
                 seen.add(key)
@@ -181,6 +207,7 @@ def create_job(db: Session, request: JobCreateRequest) -> JobCreateResponse:
             name = (recipient.name or "").strip()
             email = (recipient.email or "").strip()
             status_value = CertificateItemStatus.FAILED
+            email_status = EmailStatus.SKIPPED
             error_message = str(exc)
 
         item = CertificateItem(
@@ -190,6 +217,7 @@ def create_job(db: Session, request: JobCreateRequest) -> JobCreateResponse:
             recipient_email=email,
             status=status_value,
             error_message=error_message,
+            email_status=email_status,
         )
         db.add(item)
 
@@ -222,6 +250,10 @@ def get_job(db: Session, job_id: str, offset: int = 0, limit: int = 50, status_f
         succeeded=counts["succeeded"],
         failed=counts["failed"],
         pending=counts["pending"],
+        email_sent=counts["email_sent"],
+        email_failed=counts["email_failed"],
+        email_pending=counts["email_pending"],
+        email_skipped=counts["email_skipped"],
         created_at=job.created_at,
         completed_at=job.completed_at,
         items=[_item_to_response(item) for item in items],

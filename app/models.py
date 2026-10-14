@@ -49,6 +49,16 @@ class CertificateItemStatus:
     ALL = {PENDING, PROCESSING, SUCCESS, FAILED}
 
 
+class EmailStatus:
+    PENDING = "PENDING"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+    ALL = {PENDING, SENDING, SENT, FAILED, SKIPPED}
+
+
 class CertificateItem(Base):
     __tablename__ = "certificate_items"
 
@@ -59,6 +69,9 @@ class CertificateItem(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default=CertificateItemStatus.PENDING)
     file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_status: Mapped[str] = mapped_column(String(32), nullable=False, default=EmailStatus.PENDING)
+    email_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
     job: Mapped[Job] = relationship(back_populates="items")
